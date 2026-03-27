@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="VR.HDRFix.Tester/VR.HDRFix.Tester.csproj" />
+  <Project Path="VR.HDRFix/VR.HDRFix.csproj" />
+</Solution>
