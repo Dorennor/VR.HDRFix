@@ -8,6 +8,8 @@
 	<DebugType>none</DebugType>
 	<DebugSymbols>false</DebugSymbols>
 	<CopyOutputSymbolsToPublishDirectory>false</CopyOutputSymbolsToPublishDirectory>
+	<ServerGarbageCollection>false</ServerGarbageCollection>
+	<RetainVMGarbageCollection>false</RetainVMGarbageCollection>
   </PropertyGroup>
 
   <ItemGroup>
