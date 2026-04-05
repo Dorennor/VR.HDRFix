@@ -1,4 +1,5 @@
-﻿using System.IO;
+﻿using System.Collections.Concurrent;
+using System.IO;
 
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Options;
@@ -14,6 +15,8 @@ namespace VR.HDRFix
     {
         private readonly IOptionsMonitor<Settings> _optionsMonitor;
         private readonly List<FileSystemWatcher> _watchers = [];
+        private readonly ConcurrentDictionary<string, byte> _processingFiles = new();
+        private readonly SemaphoreSlim _concurrencySemaphore = new(2);
         private IDisposable _configChangeToken;
 
         public HdrWorker(IOptionsMonitor<Settings> optionsMonitor)
@@ -21,17 +24,30 @@ namespace VR.HDRFix
             _optionsMonitor = optionsMonitor;
         }
 
-        protected override Task ExecuteAsync(CancellationToken stoppingToken)
+        protected override async Task ExecuteAsync(CancellationToken stoppingToken)
         {
-            SetupWatchers(_optionsMonitor.CurrentValue);
+            Log.Information("HDR Fix Service is starting up...");
 
-            _configChangeToken = _optionsMonitor.OnChange(newConfig =>
+            try
             {
-                Log.Information("appsettings.json changed! Re-initializing watchers...");
-                SetupWatchers(newConfig);
-            });
+                SetupWatchers(_optionsMonitor.CurrentValue);
 
-            return Task.Delay(Timeout.Infinite, stoppingToken);
+                _configChangeToken = _optionsMonitor.OnChange(newConfig =>
+                {
+                    Log.Information("Configuration changed. Re-initializing watchers...");
+                    SetupWatchers(newConfig);
+                });
+
+                await Task.Delay(Timeout.Infinite, stoppingToken);
+            }
+            catch (OperationCanceledException)
+            {
+                Log.Information("Service stop requested.");
+            }
+            catch (Exception ex)
+            {
+                Log.Fatal(ex, "Service encountered an unrecoverable error in the main loop.");
+            }
         }
 
         private void SetupWatchers(Settings config)
@@ -39,123 +55,148 @@ namespace VR.HDRFix
             foreach (var watcher in _watchers)
             {
                 watcher.EnableRaisingEvents = false;
-
-                watcher.Created -= OnFileCreated;
-                watcher.Changed -= OnFileCreated;
-
+                watcher.Created -= OnFileEvent;
+                watcher.Changed -= OnFileEvent;
                 watcher.Dispose();
             }
-
             _watchers.Clear();
+
+            if (config.WatchFolders == null || config.WatchFolders.Length == 0)
+            {
+                Log.Warning("No watch folders configured in appsettings.json.");
+                return;
+            }
 
             foreach (var folder in config.WatchFolders)
             {
                 if (!Directory.Exists(folder))
                 {
-                    Log.Warning("Directory does not exist, skipping: {Folder}", folder);
+                    Log.Warning("Target folder does not exist, skipping: {Folder}", folder);
                     continue;
                 }
 
                 var watcher = new FileSystemWatcher(folder)
                 {
                     Filter = StringConstants.JxrFilter,
-                    NotifyFilter = NotifyFilters.FileName | NotifyFilters.LastWrite,
+                    NotifyFilter = NotifyFilters.FileName | NotifyFilters.LastWrite | NotifyFilters.Size,
                     IncludeSubdirectories = true,
                     EnableRaisingEvents = true
                 };
 
-                watcher.Created += OnFileCreated;
-                watcher.Changed += OnFileCreated;
+                watcher.Created += OnFileEvent;
+                watcher.Changed += OnFileEvent;
 
                 _watchers.Add(watcher);
-                Log.Information("Watching folder: {Folder} and its subdirectories", folder);
+                Log.Information("Successfully attached watcher to: {Folder}", folder);
             }
         }
 
-        private void OnFileCreated(object sender, FileSystemEventArgs eventArgs)
+        private void OnFileEvent(object sender, FileSystemEventArgs e)
         {
-            if (eventArgs.Name != null && !eventArgs.Name.EndsWith(StringConstants.Jxr, StringComparison.OrdinalIgnoreCase))
-                return;
-
-            var currentOptions = _optionsMonitor.CurrentValue;
-
-            string relativeDir = Path.GetDirectoryName(eventArgs.Name) ?? string.Empty;
-            string outputFileName = Path.GetFileNameWithoutExtension(eventArgs.Name) + StringConstants.SdrJpg;
-
-            string targetDirectory;
-
-            if (string.IsNullOrWhiteSpace(currentOptions.OutputPath))
-            {
-                targetDirectory = Path.GetDirectoryName(eventArgs.FullPath)!;
-            }
-            else
-            {
-                targetDirectory = Path.Combine(currentOptions.OutputPath, relativeDir);
-            }
-
-            if (!Directory.Exists(targetDirectory))
-                Directory.CreateDirectory(targetDirectory);
-
-            string outputPath = Path.Combine(targetDirectory, outputFileName);
-
-            if (File.Exists(outputPath))
-                return;
-
-            Task.Run(() => ProcessFileSafe(eventArgs.FullPath, outputPath, currentOptions));
+            Task.Run(() => HandleNewFileAsync(e.FullPath, e.Name ?? string.Empty));
         }
 
-        private void ProcessFileSafe(string inputPath, string outputPath, Settings options)
+        private async Task HandleNewFileAsync(string fullPath, string relativeName)
         {
-            int maxRetries = options.Retries > 0 ? options.Retries : 10;
-            int delayMs = options.DelayMs;
+            if (!_processingFiles.TryAdd(fullPath, 0))
+                return;
 
-            string inputFileName = Path.GetFileName(inputPath);
-            string outputFileName = Path.GetFileName(outputPath);
+            try
+            {
+                var settings = _optionsMonitor.CurrentValue;
+
+                string relativeDir = Path.GetDirectoryName(relativeName) ?? string.Empty;
+                string outputFileName = Path.GetFileNameWithoutExtension(relativeName) + StringConstants.SdrJpg;
+
+                string targetDir = string.IsNullOrWhiteSpace(settings.OutputPath)
+                    ? Path.GetDirectoryName(fullPath)!
+                    : Path.Combine(settings.OutputPath, relativeDir);
+
+                string outputPath = Path.Combine(targetDir, outputFileName);
+
+                if (File.Exists(outputPath))
+                    return;
+
+                await _concurrencySemaphore.WaitAsync();
+
+                try
+                {
+                    await ProcessFileWithRetriesAsync(fullPath, outputPath, settings);
+                }
+                finally
+                {
+                    _concurrencySemaphore.Release();
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Error(ex, "Unexpected error handling file: {File}", fullPath);
+            }
+            finally
+            {
+                _processingFiles.TryRemove(fullPath, out _);
+            }
+        }
+
+        private static async Task ProcessFileWithRetriesAsync(string inputPath, string outputPath, Settings options)
+        {
+            int maxRetries = Math.Max(1, options.Retries);
+            int delayMs = Math.Max(100, options.DelayMs);
 
             for (int i = 0; i < maxRetries; i++)
             {
                 try
                 {
-                    if (options.EnableLogging)
-                        Log.Information("Processing {File}...", inputFileName);
+                    if (!File.Exists(inputPath))
+                        return;
 
-                    using (var stream = new FileStream(inputPath, FileMode.Open, FileAccess.Read, FileShare.Read))
+                    string dir = Path.GetDirectoryName(outputPath);
+
+                    if (dir != null && !Directory.Exists(dir))
+                        Directory.CreateDirectory(dir);
+
+                    if (options.EnableLogging)
+                        Log.Information("Converting: {FileName}", Path.GetFileName(inputPath));
+
+                    await using (var stream = new FileStream(inputPath, FileMode.Open, FileAccess.Read, FileShare.Read))
                     {
                         HdrPipeline.Process(stream, outputPath, options.HdrFixSettings);
                     }
 
                     if (options.EnableLogging)
-                        Log.Information("Successfully converted: {File}", outputFileName);
+                        Log.Information("Conversion successful: {FileName}", Path.GetFileName(outputPath));
 
                     return;
                 }
-                catch (IOException)
+                catch (IOException) when (i < maxRetries - 1)
                 {
                     if (options.EnableLogging)
-                        Log.Warning("File locked, retrying {Retry}/{Max}...", i + 1, maxRetries);
+                        Log.Warning("File locked or being written. Retry {Current}/{Total} for {File}", i + 1, maxRetries, Path.GetFileName(inputPath));
 
-                    Thread.Sleep(delayMs);
+                    await Task.Delay(delayMs);
                 }
                 catch (Exception ex)
                 {
-                    Log.Error(ex, "Fatal error processing file: {File}", inputFileName);
+                    Log.Error(ex, "Fatal error processing {File}", inputPath);
                     return;
                 }
             }
 
-            Log.Warning("Failed to access {File} after {Retries} retries.", inputFileName, maxRetries);
+            Log.Error("Failed to process {File} after {Count} attempts.", inputPath, maxRetries);
         }
 
         public override void Dispose()
         {
-            GC.SuppressFinalize(this);
-
             _configChangeToken?.Dispose();
 
             foreach (var watcher in _watchers)
                 watcher.Dispose();
 
+            _concurrencySemaphore.Dispose();
+
             base.Dispose();
+
+            GC.SuppressFinalize(this);
         }
     }
 }

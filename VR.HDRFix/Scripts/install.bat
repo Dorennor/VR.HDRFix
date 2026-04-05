@@ -15,5 +15,9 @@ set "BIN_PATH=%CD%\%EXE_NAME%"
 popd
 
 sc create "%SERVICE_NAME%" binPath= "\"%BIN_PATH%\"" start= auto DisplayName= "%DISPLAY_NAME%"
+sc failure "%SERVICE_NAME%" reset= 86400 actions= restart/60000/restart/60000/restart/60000
+
 sc start "%SERVICE_NAME%"
+
+echo Service installation and recovery configuration complete.
 pause
