@@ -19,7 +19,7 @@ Since I am more comfortable with .NET than Rust, and was unable to fix the origi
 
 ## License
 
-This project is a rework, not a direct port. Please see the original [`hdrfix`](https://github.com/bvibber/hdrfix) repository for its license and terms. The license for this project is in the `LICENSE` file.
+This project is a rework, not a direct port. Please see the original [`hdrfix`](https://github.com/bvibber/hdrfix) repository for its license and terms.
 
 ---
 
