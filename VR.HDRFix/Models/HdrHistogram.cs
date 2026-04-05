@@ -1,6 +1,9 @@
 ﻿using System.Numerics;
+using System.Runtime.CompilerServices;
 
-namespace VR.HDRFix
+using VR.HDRFix.Helpers;
+
+namespace VR.HDRFix.Models
 {
     public class HdrHistogram
     {
@@ -8,26 +11,26 @@ namespace VR.HDRFix
 
         public HdrHistogram(Vector3[] pixels)
         {
-            // Рахуємо яскравість (Luma) для кожного пікселя
             _lumaVals = pixels.Select(p => HdrMath.LumaRgb(p)).ToArray();
 
-            // Сортуємо для обчислення перцентилів (еквівалент par_sort_unstable_by)
             Array.Sort(_lumaVals);
         }
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public float Percentile(float targetPercent)
         {
-            if (_lumaVals.Length == 0) return 0f;
+            if (_lumaVals.Length == 0)
+                return 0f;
 
             int maxIndex = _lumaVals.Length - 1;
             int targetIndex = (int)(maxIndex * (targetPercent / 100.0));
 
-            // Захист від виходу за межі
             targetIndex = Math.Clamp(targetIndex, 0, maxIndex);
 
             return _lumaVals[targetIndex];
         }
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public float AverageBelowPercentile(float percent)
         {
             float maxLuma = Percentile(percent);
@@ -36,7 +39,9 @@ namespace VR.HDRFix
 
             foreach (var luma in _lumaVals)
             {
-                if (luma > maxLuma) continue;
+                if (luma > maxLuma)
+                    continue;
+
                 sum += luma;
                 count++;
             }

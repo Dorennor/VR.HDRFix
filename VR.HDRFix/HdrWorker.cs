@@ -1,104 +1,160 @@
 ﻿using System.IO;
 
 using Microsoft.Extensions.Hosting;
-using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
+
+using Serilog;
+
+using VR.HDRFix.Configs;
+using VR.HDRFix.Helpers;
 
 namespace VR.HDRFix
 {
     public class HdrWorker : BackgroundService
     {
-        private readonly ILogger<HdrWorker> _logger;
-        private readonly IOptionsMonitor<HdrFixOptions> _options;
-        private FileSystemWatcher? _watcher;
+        private readonly IOptionsMonitor<Settings> _optionsMonitor;
+        private readonly List<FileSystemWatcher> _watchers = [];
+        private IDisposable _configChangeToken;
 
-        public HdrWorker(ILogger<HdrWorker> logger, IOptionsMonitor<HdrFixOptions> options)
+        public HdrWorker(IOptionsMonitor<Settings> optionsMonitor)
         {
-            _logger = logger;
-            _options = options;
+            _optionsMonitor = optionsMonitor;
         }
 
         protected override Task ExecuteAsync(CancellationToken stoppingToken)
         {
-            var config = _options.CurrentValue;
+            SetupWatchers(_optionsMonitor.CurrentValue);
 
-            if (!Directory.Exists(config.WatchFolder))
+            _configChangeToken = _optionsMonitor.OnChange(newConfig =>
             {
-                _logger.LogError("Directory {WatchFolder} does not exist. Waiting...", config.WatchFolder);
-                // Тут можна додати логіку очікування створення папки, якщо потрібно
-                return Task.CompletedTask;
-            }
+                Log.Information("appsettings.json changed! Re-initializing watchers...");
+                SetupWatchers(newConfig);
+            });
 
-            _watcher = new FileSystemWatcher(config.WatchFolder)
-            {
-                Filter = "*.jxr",
-                NotifyFilter = NotifyFilters.FileName | NotifyFilters.LastWrite,
-                EnableRaisingEvents = true
-            };
-
-            _watcher.Created += OnFileCreated;
-            _watcher.Changed += OnFileCreated; // Для файлів, які дописуються
-
-            _logger.LogInformation("HDRFix Service started. Watching folder: {Folder}", config.WatchFolder);
-
-            // Тримаємо сервіс живим, поки не прийде сигнал зупинки
             return Task.Delay(Timeout.Infinite, stoppingToken);
         }
 
-        private void OnFileCreated(object sender, FileSystemEventArgs e)
+        private void SetupWatchers(Settings config)
         {
-            if (!e.Name!.EndsWith(".jxr", StringComparison.OrdinalIgnoreCase)) return;
+            foreach (var watcher in _watchers)
+            {
+                watcher.EnableRaisingEvents = false;
 
-            string outputPath = Path.ChangeExtension(e.FullPath, "-sdr.jpg");
-            if (File.Exists(outputPath)) return;
+                watcher.Created -= OnFileCreated;
+                watcher.Changed -= OnFileCreated;
 
-            // Запускаємо обробку у фоні, щоб не блокувати FileSystemWatcher
-            Task.Run(() => ProcessFileSafe(e.FullPath, outputPath));
+                watcher.Dispose();
+            }
+
+            _watchers.Clear();
+
+            foreach (var folder in config.WatchFolders)
+            {
+                if (!Directory.Exists(folder))
+                {
+                    Log.Warning("Directory does not exist, skipping: {Folder}", folder);
+                    continue;
+                }
+
+                var watcher = new FileSystemWatcher(folder)
+                {
+                    Filter = StringConstants.JxrFilter,
+                    NotifyFilter = NotifyFilters.FileName | NotifyFilters.LastWrite,
+                    IncludeSubdirectories = true,
+                    EnableRaisingEvents = true
+                };
+
+                watcher.Created += OnFileCreated;
+                watcher.Changed += OnFileCreated;
+
+                _watchers.Add(watcher);
+                Log.Information("Watching folder: {Folder} and its subdirectories", folder);
+            }
         }
 
-        private void ProcessFileSafe(string inputPath, string outputPath)
+        private void OnFileCreated(object sender, FileSystemEventArgs eventArgs)
         {
-            int maxRetries = 10;
-            int delayMs = 500;
+            if (eventArgs.Name != null && !eventArgs.Name.EndsWith(StringConstants.Jxr, StringComparison.OrdinalIgnoreCase))
+                return;
+
+            var currentOptions = _optionsMonitor.CurrentValue;
+
+            string relativeDir = Path.GetDirectoryName(eventArgs.Name) ?? string.Empty;
+            string outputFileName = Path.GetFileNameWithoutExtension(eventArgs.Name) + StringConstants.SdrJpg;
+
+            string targetDirectory;
+
+            if (string.IsNullOrWhiteSpace(currentOptions.OutputPath))
+            {
+                targetDirectory = Path.GetDirectoryName(eventArgs.FullPath)!;
+            }
+            else
+            {
+                targetDirectory = Path.Combine(currentOptions.OutputPath, relativeDir);
+            }
+
+            if (!Directory.Exists(targetDirectory))
+                Directory.CreateDirectory(targetDirectory);
+
+            string outputPath = Path.Combine(targetDirectory, outputFileName);
+
+            if (File.Exists(outputPath))
+                return;
+
+            Task.Run(() => ProcessFileSafe(eventArgs.FullPath, outputPath, currentOptions));
+        }
+
+        private void ProcessFileSafe(string inputPath, string outputPath, Settings options)
+        {
+            int maxRetries = options.Retries > 0 ? options.Retries : 10;
+            int delayMs = options.DelayMs;
+
+            string inputFileName = Path.GetFileName(inputPath);
+            string outputFileName = Path.GetFileName(outputPath);
 
             for (int i = 0; i < maxRetries; i++)
             {
                 try
                 {
-                    // Перевіряємо, чи NVIDIA вже відпустила файл
-                    using (var fs = new FileStream(inputPath, FileMode.Open, FileAccess.Read, FileShare.None)) { }
+                    if (options.EnableLogging)
+                        Log.Information("Processing {File}...", inputFileName);
 
-                    // !!! МАГІЯ ТУТ !!!
-                    // Беремо найсвіжіші налаштування на момент конвертації
-                    var currentSettings = _options.CurrentValue;
+                    using (var stream = new FileStream(inputPath, FileMode.Open, FileAccess.Read, FileShare.Read))
+                    {
+                        HdrPipeline.Process(stream, outputPath, options.HdrFixSettings);
+                    }
 
-                    _logger.LogInformation("Processing {File} with Exposure: {Exp}, Saturation: {Sat}",
-                        Path.GetFileName(inputPath), currentSettings.Exposure, currentSettings.Saturation);
+                    if (options.EnableLogging)
+                        Log.Information("Successfully converted: {File}", outputFileName);
 
-                    // Виклик пайплайну конвертації, передаємо туди актуальні налаштування
-                    // HdrPipeline.Process(inputPath, outputPath, currentSettings);
-
-                    _logger.LogInformation("Successfully converted: {File}", Path.GetFileName(outputPath));
                     return;
                 }
                 catch (IOException)
                 {
-                    // Файл ще заблокований, чекаємо
+                    if (options.EnableLogging)
+                        Log.Warning("File locked, retrying {Retry}/{Max}...", i + 1, maxRetries);
+
                     Thread.Sleep(delayMs);
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, "Error processing file: {File}", inputPath);
+                    Log.Error(ex, "Fatal error processing file: {File}", inputFileName);
                     return;
                 }
             }
 
-            _logger.LogWarning("Failed to access {File} after {Retries} retries.", inputPath, maxRetries);
+            Log.Warning("Failed to access {File} after {Retries} retries.", inputFileName, maxRetries);
         }
 
         public override void Dispose()
         {
-            _watcher?.Dispose();
+            GC.SuppressFinalize(this);
+
+            _configChangeToken?.Dispose();
+
+            foreach (var watcher in _watchers)
+                watcher.Dispose();
+
             base.Dispose();
         }
     }

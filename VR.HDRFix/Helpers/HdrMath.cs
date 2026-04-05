@@ -1,20 +1,16 @@
 ﻿using System.Numerics;
+using System.Runtime.CompilerServices;
 
-namespace VR.HDRFix
+using VR.HDRFix.Models;
+
+namespace VR.HDRFix.Helpers
 {
-    public struct Oklab
-    {
-        public float L, A, B;
-
-        public Oklab(float l, float a, float b)
-        { L = l; A = a; B = b; }
-    }
-
     public static class HdrMath
     {
-        public const float SDR_WHITE = 200.0f;
-        public const float REC2100_MAX = 10000.0f;
+        public const float SdrWhite = 200.0f;
+        public const float Rec2100Max = 10000.0f;
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static Vector3 Pow(Vector3 v, float power)
         {
             return new Vector3(
@@ -26,24 +22,32 @@ namespace VR.HDRFix
 
         #region Basic Color & Brightness Math
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static float LumaRgb(Vector3 val)
         {
             return val.X * 0.2126f + val.Y * 0.7152f + val.Z * 0.0722f;
         }
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static Vector3 ScaleRgb(Vector3 val, float lumaOut)
         {
             float lumaIn = LumaRgb(val);
-            if (lumaIn < 1e-6f) return val;
+
+            if (lumaIn < 1e-6f)
+                return val;
+
             float scale = lumaOut / lumaIn;
+
             return val * scale;
         }
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static Vector3 Clip(Vector3 input)
         {
             return Vector3.Clamp(input, Vector3.Zero, Vector3.One);
         }
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static Vector3 LinearToSrgb(Vector3 val)
         {
             var min = new Vector3(0.0031308f);
@@ -61,6 +65,7 @@ namespace VR.HDRFix
 
         #region Oklab Color Space Conversions
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static Oklab LinearSrgbToOklab(Vector3 c)
         {
             float l = 0.4122214708f * c.X + 0.5363325363f * c.Y + 0.0514459929f * c.Z;
@@ -78,6 +83,7 @@ namespace VR.HDRFix
             );
         }
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static Vector3 OklabToLinearSrgb(Oklab c)
         {
             float l_ = c.L + 0.3963377774f * c.A + 0.2158037573f * c.B;
@@ -95,35 +101,47 @@ namespace VR.HDRFix
             );
         }
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static float LumaOklab(Oklab val)
         {
             var oklabGray = new Oklab(val.L, 0.0f, 0.0f);
             var rgbGray = OklabToLinearSrgb(oklabGray);
+
             return rgbGray.X;
         }
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static float OklabLForLuma(float luma)
         {
             var grayRgb = new Vector3(luma, luma, luma);
             var grayOklab = LinearSrgbToOklab(grayRgb);
+
             return grayOklab.L;
         }
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static Oklab ScaleOklab(Oklab oklabIn, float lumaOut)
         {
-            if (oklabIn.L == 0.0f) return oklabIn;
+            if (oklabIn.L == 0.0f)
+                return oklabIn;
+
             float grayL = OklabLForLuma(lumaOut);
             float ratio = grayL / oklabIn.L;
+
             return new Oklab(grayL, oklabIn.A * ratio, oklabIn.B * ratio);
         }
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static Oklab ScaleOklabDesat(Oklab oklabIn, float lumaOut, float saturation)
         {
             float lIn = oklabIn.L;
-            if (lIn == 0.0f) return oklabIn;
+
+            if (lIn == 0.0f)
+                return oklabIn;
 
             float lOut = OklabLForLuma(lumaOut);
             float ratio = MathF.Pow(lOut / lIn, 3.0f / saturation);
+
             return new Oklab(lOut, oklabIn.A * ratio, oklabIn.B * ratio);
         }
 
@@ -131,35 +149,44 @@ namespace VR.HDRFix
 
         #region Color Mapping (Binary Search)
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static Vector3 BinarySearchColorMap(Vector3 input, Func<Oklab, float, Vector3> modifier)
         {
             var oklabIn = LinearSrgbToOklab(input);
+
             float min = 0.0f;
             float max = 1.0f;
+
             Vector3 result = input;
 
-            // Ітеративний бінарний пошук (аналог rust binary_search)
             for (int i = 0; i < 32; i++)
             {
                 float mid = (min + max) / 2.0f;
+
                 result = modifier(oklabIn, mid);
 
                 float maxElement = Math.Max(Math.Max(result.X, result.Y), result.Z);
                 float delta = min - max;
 
-                if (Math.Abs(delta) < 0.001f || Math.Abs(maxElement - 1.0f) < 0.001f) break;
+                if (Math.Abs(delta) < 0.001f || Math.Abs(maxElement - 1.0f) < 0.001f)
+                    break;
 
-                if (maxElement < 1.0f) min = mid; // занадто темно, треба вище значення
-                else max = mid;                   // все ще виходить за 1.0, треба нижче
+                if (maxElement < 1.0f)
+                    min = mid;
+                else
+                    max = mid;
             }
 
             return Clip(result);
         }
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static Vector3 ColorDarkenOklab(Vector3 cIn)
         {
             float max = Math.Max(Math.Max(cIn.X, cIn.Y), cIn.Z);
-            if (max <= 1.0f) return cIn;
+
+            if (max <= 1.0f)
+                return cIn;
 
             return BinarySearchColorMap(cIn, (oklab, brightness) =>
             {
@@ -168,10 +195,13 @@ namespace VR.HDRFix
             });
         }
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static Vector3 ColorDesatOklab(Vector3 cIn)
         {
             float max = Math.Max(Math.Max(cIn.X, cIn.Y), cIn.Z);
-            if (max <= 1.0f) return cIn;
+
+            if (max <= 1.0f)
+                return cIn;
 
             return BinarySearchColorMap(cIn, (oklab, saturation) =>
             {
@@ -184,21 +214,24 @@ namespace VR.HDRFix
 
         #region Tone Mapping Algorithms
 
-        // Uncharted 2 / Hable
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static float Uncharted2TonemapPartial(float x)
         {
             const float A = 0.15f, B = 0.50f, C = 0.10f, D = 0.20f, E = 0.02f, F = 0.30f;
             return ((x * (A * x + (C * B)) + (D * E)) / (x * (A * x + B) + (D * F))) - (E / F);
         }
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static Vector3 TonemapUncharted2(Vector3 val)
         {
             float exposureBias = 2.0f;
             float curr = Uncharted2TonemapPartial(LumaRgb(val) * exposureBias);
             float whiteScale = 1.0f / Uncharted2TonemapPartial(11.2f);
+
             return ScaleRgb(val, curr * whiteScale);
         }
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static Vector3 TonemapHable(Vector3 val)
         {
             float luma = LumaRgb(val);
@@ -212,7 +245,7 @@ namespace VR.HDRFix
             return rgbOut * ((curr * whiteScale) / sigOrig);
         }
 
-        // ACES
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static Vector3 AcesMul(float[] m, Vector3 v)
         {
             return new Vector3(
@@ -222,6 +255,7 @@ namespace VR.HDRFix
             );
         }
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static Vector3 TonemapAces(Vector3 cIn)
         {
             var inputMatrix = new[] { 0.59719f, 0.35458f, 0.04823f, 0.07600f, 0.90834f, 0.01566f, 0.02840f, 0.13383f, 0.83777f };
@@ -236,13 +270,14 @@ namespace VR.HDRFix
             return AcesMul(outputMatrix, v);
         }
 
-        // Reinhard
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static Vector3 TonemapReinhardRgb(Vector3 cIn, float hdrMax)
         {
             float white2 = hdrMax * hdrMax;
             return cIn * (Vector3.One + cIn / new Vector3(white2)) / (Vector3.One + cIn);
         }
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static Vector3 TonemapReinhardOklab(Vector3 cIn, float hdrMax, float saturation)
         {
             float white2 = hdrMax * hdrMax;
@@ -258,10 +293,12 @@ namespace VR.HDRFix
 
         #region Levels Processing
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static Vector3 ApplyLevels(Vector3 cIn, float levelMin, float levelMax, float gamma)
         {
             float scale = levelMax - levelMin;
-            if (scale == 0f) return cIn; // Захист від ділення на нуль
+            if (scale == 0f)
+                return cIn;
 
             var oklabIn = LinearSrgbToOklab(cIn);
             float lumaIn = LumaOklab(oklabIn);
