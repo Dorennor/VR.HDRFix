@@ -40,7 +40,11 @@ namespace VR.HDRFix
                 _configChangeToken = _optionsMonitor.OnChange(newConfig =>
                 {
                     Log.Information("Configuration changed. Re-initializing watchers...");
-                    SetupWatchers(newConfig);
+
+                    lock (_watchersLock)
+                    {
+                        SetupWatchers(newConfig);
+                    }
                 });
 
                 await Task.Delay(Timeout.Infinite, stoppingToken);
@@ -70,14 +74,14 @@ namespace VR.HDRFix
             {
                 if (!Directory.Exists(folder))
                 {
-                    Log.Warning("Target folder does not exist, skipping: {Folder}", folder);
+                    Log.Warning("Target folder does not exist, folder name: {Folder}", folder);
                     Directory.CreateDirectory(folder);
                 }
 
                 var rootWatcher = InitializeRootWatcher(folder);
-                var watcher = InitializeInputWatcher(folder);
-
                 _rootFoldersWatchers.Add(rootWatcher);
+
+                var watcher = InitializeInputWatcher(folder);
                 _watchers.Add(watcher);
 
                 Log.Information("Successfully attached watcher to: {Folder}", folder);
@@ -153,10 +157,13 @@ namespace VR.HDRFix
             if (!Directory.Exists(eventArgs.FullPath))
                 Directory.CreateDirectory(eventArgs.FullPath);
 
-            lock (_watchersLock)
+            Task.Run(() =>
             {
-                SetupWatchers(_optionsMonitor.CurrentValue);
-            }
+                lock (_watchersLock)
+                {
+                    SetupWatchers(_optionsMonitor.CurrentValue);
+                }
+            });
         }
 
         private async Task HandleNewFileAsync(string fullPath, string relativeName)
@@ -252,11 +259,14 @@ namespace VR.HDRFix
         {
             _configChangeToken?.Dispose();
 
-            foreach (var rootWatcher in _rootFoldersWatchers)
-                rootWatcher.Dispose();
+            lock (_watchersLock)
+            {
+                foreach (var rootWatcher in _rootFoldersWatchers)
+                    rootWatcher.Dispose();
 
-            foreach (var watcher in _watchers)
-                watcher.Dispose();
+                foreach (var watcher in _watchers)
+                    watcher.Dispose();
+            }
 
             _concurrencySemaphore.Dispose();
 
