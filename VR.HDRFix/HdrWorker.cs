@@ -14,8 +14,10 @@ namespace VR.HDRFix
     public class HdrWorker : BackgroundService
     {
         private readonly IOptionsMonitor<Settings> _optionsMonitor;
+        private readonly List<FileSystemWatcher> _rootFoldersWatchers = [];
         private readonly List<FileSystemWatcher> _watchers = [];
         private readonly ConcurrentDictionary<string, byte> _processingFiles = new();
+        private readonly Lock _watchersLock = new();
         private readonly SemaphoreSlim _concurrencySemaphore = new(2);
         private IDisposable _configChangeToken;
 
@@ -30,7 +32,10 @@ namespace VR.HDRFix
 
             try
             {
-                SetupWatchers(_optionsMonitor.CurrentValue);
+                lock (_watchersLock)
+                {
+                    SetupWatchers(_optionsMonitor.CurrentValue);
+                }
 
                 _configChangeToken = _optionsMonitor.OnChange(newConfig =>
                 {
@@ -52,14 +57,8 @@ namespace VR.HDRFix
 
         private void SetupWatchers(Settings config)
         {
-            foreach (var watcher in _watchers)
-            {
-                watcher.EnableRaisingEvents = false;
-                watcher.Created -= OnFileEvent;
-                watcher.Changed -= OnFileEvent;
-                watcher.Dispose();
-            }
-            _watchers.Clear();
+            ClearRootWatchers();
+            ClearInputWatchers();
 
             if (config.WatchFolders == null || config.WatchFolders.Length == 0)
             {
@@ -72,28 +71,92 @@ namespace VR.HDRFix
                 if (!Directory.Exists(folder))
                 {
                     Log.Warning("Target folder does not exist, skipping: {Folder}", folder);
-                    continue;
+                    Directory.CreateDirectory(folder);
                 }
 
-                var watcher = new FileSystemWatcher(folder)
-                {
-                    Filter = StringConstants.JxrFilter,
-                    NotifyFilter = NotifyFilters.FileName | NotifyFilters.LastWrite | NotifyFilters.Size,
-                    IncludeSubdirectories = true,
-                    EnableRaisingEvents = true
-                };
+                var rootWatcher = InitializeRootWatcher(folder);
+                var watcher = InitializeInputWatcher(folder);
 
-                watcher.Created += OnFileEvent;
-                watcher.Changed += OnFileEvent;
-
+                _rootFoldersWatchers.Add(rootWatcher);
                 _watchers.Add(watcher);
+
                 Log.Information("Successfully attached watcher to: {Folder}", folder);
             }
         }
 
-        private void OnFileEvent(object sender, FileSystemEventArgs e)
+        private FileSystemWatcher InitializeRootWatcher(string folder)
         {
-            Task.Run(() => HandleNewFileAsync(e.FullPath, e.Name ?? string.Empty));
+            string parentDir = Path.GetDirectoryName(folder);
+            string folderName = Path.GetFileName(folder);
+
+            var rootWatcher = new FileSystemWatcher(parentDir, folderName)
+            {
+                NotifyFilter = NotifyFilters.DirectoryName,
+                EnableRaisingEvents = true
+            };
+
+            rootWatcher.Deleted += OnFolderDeletion;
+
+            return rootWatcher;
+        }
+
+        private FileSystemWatcher InitializeInputWatcher(string folder)
+        {
+            var watcher = new FileSystemWatcher(folder)
+            {
+                Filter = StringConstants.JxrFilter,
+                NotifyFilter = NotifyFilters.FileName | NotifyFilters.LastWrite | NotifyFilters.Size,
+                IncludeSubdirectories = true,
+                EnableRaisingEvents = true
+            };
+
+            watcher.Created += OnFileEvent;
+            watcher.Changed += OnFileEvent;
+
+            return watcher;
+        }
+
+        private void ClearRootWatchers()
+        {
+            foreach (var rootWatcher in _rootFoldersWatchers)
+            {
+                rootWatcher.EnableRaisingEvents = false;
+                rootWatcher.Deleted -= OnFolderDeletion;
+                rootWatcher.Dispose();
+            }
+
+            _rootFoldersWatchers.Clear();
+        }
+
+        private void ClearInputWatchers()
+        {
+            foreach (var watcher in _watchers)
+            {
+                watcher.EnableRaisingEvents = false;
+
+                watcher.Created -= OnFileEvent;
+                watcher.Changed -= OnFileEvent;
+
+                watcher.Dispose();
+            }
+
+            _watchers.Clear();
+        }
+
+        private void OnFileEvent(object sender, FileSystemEventArgs eventArgs)
+        {
+            Task.Run(() => HandleNewFileAsync(eventArgs.FullPath, eventArgs.Name ?? string.Empty));
+        }
+
+        private void OnFolderDeletion(object sender, FileSystemEventArgs eventArgs)
+        {
+            if (!Directory.Exists(eventArgs.FullPath))
+                Directory.CreateDirectory(eventArgs.FullPath);
+
+            lock (_watchersLock)
+            {
+                SetupWatchers(_optionsMonitor.CurrentValue);
+            }
         }
 
         private async Task HandleNewFileAsync(string fullPath, string relativeName)
@@ -108,9 +171,12 @@ namespace VR.HDRFix
                 string relativeDir = Path.GetDirectoryName(relativeName) ?? string.Empty;
                 string outputFileName = Path.GetFileNameWithoutExtension(relativeName) + StringConstants.SdrJpg;
 
-                string targetDir = string.IsNullOrWhiteSpace(settings.OutputPath)
-                    ? Path.GetDirectoryName(fullPath)!
-                    : Path.Combine(settings.OutputPath, relativeDir);
+                string targetDir;
+
+                if (string.IsNullOrWhiteSpace(settings.OutputPath))
+                    targetDir = Path.GetDirectoryName(fullPath);
+                else
+                    targetDir = Path.Combine(settings.OutputPath, relativeDir);
 
                 string outputPath = Path.Combine(targetDir, outputFileName);
 
@@ -155,23 +221,20 @@ namespace VR.HDRFix
                     if (dir != null && !Directory.Exists(dir))
                         Directory.CreateDirectory(dir);
 
-                    if (options.EnableLogging)
-                        Log.Information("Converting: {FileName}", Path.GetFileName(inputPath));
+                    Log.Information("Converting: {FileName}", Path.GetFileName(inputPath));
 
                     await using (var stream = new FileStream(inputPath, FileMode.Open, FileAccess.Read, FileShare.Read))
                     {
                         HdrPipeline.Process(stream, outputPath, options.HdrFixSettings);
                     }
 
-                    if (options.EnableLogging)
-                        Log.Information("Conversion successful: {FileName}", Path.GetFileName(outputPath));
+                    Log.Information("Conversion successful: {FileName}", Path.GetFileName(outputPath));
 
                     return;
                 }
                 catch (IOException) when (i < maxRetries - 1)
                 {
-                    if (options.EnableLogging)
-                        Log.Warning("File locked or being written. Retry {Current}/{Total} for {File}", i + 1, maxRetries, Path.GetFileName(inputPath));
+                    Log.Warning("File locked or being written. Retry {Current}/{Total} for {File}", i + 1, maxRetries, Path.GetFileName(inputPath));
 
                     await Task.Delay(delayMs);
                 }
@@ -188,6 +251,9 @@ namespace VR.HDRFix
         public override void Dispose()
         {
             _configChangeToken?.Dispose();
+
+            foreach (var rootWatcher in _rootFoldersWatchers)
+                rootWatcher.Dispose();
 
             foreach (var watcher in _watchers)
                 watcher.Dispose();
