@@ -1,8 +1,10 @@
 <Solution>
   <Folder Name="/Solution Items/">
     <File Path=".editorconfig" />
+    <File Path="CONTEXT.md" />
     <File Path="README.md" />
   </Folder>
   <Project Path="VR.HDRFix.Tester/VR.HDRFix.Tester.csproj" />
+  <Project Path="VR.HDRFix.Tests/VR.HDRFix.Tests.csproj" />
   <Project Path="VR.HDRFix/VR.HDRFix.csproj" />
 </Solution>

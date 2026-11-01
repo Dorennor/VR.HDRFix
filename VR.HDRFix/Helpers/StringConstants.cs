@@ -1,9 +1,8 @@
-﻿namespace VR.HDRFix.Helpers
+﻿namespace VR.HDRFix.Helpers;
+
+public static class StringConstants
 {
-    public static class StringConstants
-    {
-        public const string Jxr = ".jxr";
-        public const string JxrFilter = "*.jxr";
-        public const string SdrJpg = "-sdr.jpg";
-    }
+    public const string Jxr = ".jxr";
+    public const string JxrFilter = "*.jxr";
+    public const string SdrSuffix = "-sdr";
 }

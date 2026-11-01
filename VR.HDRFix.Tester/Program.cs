@@ -1,95 +1,89 @@
-﻿using System.IO;
+using System.Diagnostics;
+using System.IO;
 
 using VR.HDRFix.Configs;
 using VR.HDRFix.Enums;
 using VR.HDRFix.Helpers;
 
-namespace VR.HDRFix.Tester
+namespace VR.HDRFix.Tester;
+
+/// <summary>
+/// Manual converter using the same pipeline as the service.
+/// Usage: VR.HDRFix.Tester [input file or folder] [output folder] [--force] [--png] [--white=NITS] [--exposure=STOPS] [--saturation=X] [--contrast=X]
+/// </summary>
+internal static class Program
 {
-    internal class Program
+    private const string DefaultInput = @"D:\Videos\NVIDIA";
+    private const string DefaultOutput = @"D:\Videos\TEST\NVIDIA Screenshots";
+
+    private static int Main(string[] args)
     {
-        private static void Main(string[] args)
+        var positional = args.Where(a => !a.StartsWith("--", StringComparison.Ordinal)).ToArray();
+        bool force = args.Contains("--force");
+
+        string input = positional.Length > 0 ? positional[0] : DefaultInput;
+        string? output = positional.Length > 1 ? positional[1] : DefaultOutput;
+
+        var settings = new HdrFixSettings
         {
-            Console.WriteLine("Starting HDR to SDR Test...");
+            OutputFormat = args.Contains("--png") ? OutputFormat.Png : OutputFormat.Jpeg,
+            WhitePointNits = Option(args, "--white", 0.0f),
+            Exposure = Option(args, "--exposure", 0.0f),
+            Saturation = Option(args, "--saturation", new HdrFixSettings().Saturation),
+            Contrast = Option(args, "--contrast", new HdrFixSettings().Contrast)
+        };
 
-            string watchFolder = @"D:\Videos\NVIDIA";
-            string outputPath = @"D:\Pictures\NVIDIA Screenshots";
+        string root;
+        string[] files;
 
-            if (!Directory.Exists(watchFolder))
-            {
-                Console.WriteLine($"Error: Watch folder not found at {watchFolder}");
-                return;
-            }
-
-            var options = new HdrFixSettings
-            {
-                PreGamma = 1.0f,
-                Exposure = 0.0f,
-                Saturation = 1.0f,
-                PostGamma = 1.0f,
-                ToneMap = ToneMap.Hable,
-                ColorMap = ColorMap.Clip
-            };
-
-            string[] files = Directory.GetFiles(watchFolder, "*.jxr", SearchOption.AllDirectories);
-
-            if (files.Length == 0)
-            {
-                Console.WriteLine("No .jxr files found in watch folder or its subdirectories.");
-                return;
-            }
-
-            foreach (string fileFullPath in files)
-            {
-                try
-                {
-                    Console.WriteLine($"Processing {fileFullPath}...");
-
-                    string fileDir = Path.GetDirectoryName(fileFullPath)!;
-                    string relativeDir = Path.GetRelativePath(watchFolder, fileDir);
-
-                    if (relativeDir == ".")
-                        relativeDir = string.Empty;
-
-                    string targetDirectory;
-
-                    if (string.IsNullOrWhiteSpace(outputPath))
-                    {
-                        targetDirectory = fileDir;
-                    }
-                    else
-                    {
-                        targetDirectory = Path.Combine(outputPath, relativeDir);
-                    }
-
-                    if (!Directory.Exists(targetDirectory))
-                        Directory.CreateDirectory(targetDirectory);
-
-                    string outputFileName = Path.GetFileNameWithoutExtension(fileFullPath) + "-sdr.jpg";
-                    string targetFilePath = Path.Combine(targetDirectory, outputFileName);
-
-                    if (File.Exists(targetFilePath))
-                    {
-                        Console.WriteLine($"File already exists, skipping: {targetFilePath}");
-                        continue;
-                    }
-
-                    using (var stream = new FileStream(fileFullPath, FileMode.Open, FileAccess.Read, FileShare.Read))
-                    {
-                        HdrPipeline.Process(stream, targetFilePath, options);
-                    }
-
-                    Console.WriteLine($"Success! Saved to {targetFilePath}");
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"Error processing {fileFullPath}: {ex.Message}");
-                }
-            }
-
-            Console.WriteLine("Finished processing all files.");
-            Console.WriteLine("Press any key to exit...");
-            Console.ReadKey();
+        if (File.Exists(input))
+        {
+            root = Path.GetDirectoryName(Path.GetFullPath(input))!;
+            files = [input];
         }
+        else if (Directory.Exists(input))
+        {
+            root = input;
+            files = Directory.GetFiles(input, StringConstants.JxrFilter, SearchOption.AllDirectories);
+        }
+        else
+        {
+            Console.WriteLine($"Input not found: {input}");
+            return 1;
+        }
+
+        Console.WriteLine($"Converting {files.Length} file(s)...");
+        int failed = 0;
+
+        foreach (var file in files)
+        {
+            string target = OutputPaths.GetOutputPath(file, root, output, settings.OutputFormat);
+
+            if (!force && File.Exists(target))
+            {
+                Console.WriteLine($"  skip (exists)  {target}");
+                continue;
+            }
+
+            try
+            {
+                var sw = Stopwatch.StartNew();
+                var r = HdrPipeline.ConvertFile(file, target, settings);
+                Console.WriteLine($"  ok  {sw.ElapsedMilliseconds,5} ms  white {r.WhitePointNits,4:F0} nits  peak {r.PeakNits,5:F0} nits  {target}");
+            }
+            catch (Exception ex)
+            {
+                failed++;
+                Console.WriteLine($"  FAILED  {file}: {ex.Message}");
+            }
+        }
+
+        return failed == 0 ? 0 : 2;
+    }
+
+    private static float Option(string[] args, string name, float fallback)
+    {
+        var arg = args.FirstOrDefault(a => a.StartsWith(name + "=", StringComparison.Ordinal));
+        return arg != null && float.TryParse(arg[(name.Length + 1)..], System.Globalization.CultureInfo.InvariantCulture, out var v) ? v : fallback;
     }
 }

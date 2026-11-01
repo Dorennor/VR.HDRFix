@@ -1,278 +1,363 @@
 ﻿using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.IO;
+using System.Runtime;
+using System.Threading.Channels;
 
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
-
-using Serilog;
 
 using VR.HDRFix.Configs;
 using VR.HDRFix.Helpers;
 
-namespace VR.HDRFix
+namespace VR.HDRFix;
+
+/// <summary>
+/// Watches folders for new HDR screenshots and converts them through a queue.
+/// <list type="bullet">
+/// <item>File events only enqueue work; a fixed number of consumers do the conversions.</item>
+/// <item>Watchers are rebuilt on config change, watcher error (buffer overflow, folder deleted) or a missing folder.</item>
+/// <item>Recent unconverted files are picked up on startup and after every rebuild, so missed events are recovered.</item>
+/// </list>
+/// </summary>
+public sealed class HdrWorker : BackgroundService
 {
-    public class HdrWorker : BackgroundService
+    private static readonly TimeSpan MonitorInterval = TimeSpan.FromSeconds(2);
+    private static readonly TimeSpan FolderCheckInterval = TimeSpan.FromSeconds(30);
+
+    private readonly IOptionsMonitor<Settings> _options;
+    private readonly ILogger<HdrWorker> _logger;
+    private readonly Channel<WorkItem> _queue = Channel.CreateUnbounded<WorkItem>();
+    private readonly ConcurrentDictionary<string, byte> _pending = new(StringComparer.OrdinalIgnoreCase);
+    private readonly List<FileSystemWatcher> _watchers = [];
+    private readonly Lock _watchersLock = new();
+
+    private IDisposable? _configChangeToken;
+    private int _rebuildRequested;
+
+    public HdrWorker(IOptionsMonitor<Settings> options, ILogger<HdrWorker> logger)
     {
-        private readonly IOptionsMonitor<Settings> _optionsMonitor;
-        private readonly List<FileSystemWatcher> _rootFoldersWatchers = [];
-        private readonly List<FileSystemWatcher> _watchers = [];
-        private readonly ConcurrentDictionary<string, byte> _processingFiles = new();
-        private readonly Lock _watchersLock = new();
-        private readonly SemaphoreSlim _concurrencySemaphore = new(2);
-        private IDisposable _configChangeToken;
+        _options = options;
+        _logger = logger;
+    }
 
-        public HdrWorker(IOptionsMonitor<Settings> optionsMonitor)
+    private readonly record struct WorkItem(string InputPath, string WatchRoot);
+
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        var settings = _options.CurrentValue;
+
+        RebuildWatchers(settings);
+        ScanRecentFiles(settings);
+
+        // Config reloads often fire twice per save; the monitor loop collapses them into one rebuild.
+        _configChangeToken = _options.OnChange(_ => RequestRebuild("configuration changed"));
+
+        int consumers = Math.Clamp(settings.MaxConcurrentConversions, 1, 8);
+
+        var tasks = Enumerable.Range(0, consumers)
+            .Select(_ => ConsumeQueueAsync(stoppingToken))
+            .Append(MonitorAsync(stoppingToken))
+            .ToArray();
+
+        try
         {
-            _optionsMonitor = optionsMonitor;
+            await Task.WhenAll(tasks);
         }
-
-        protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
         {
-            Log.Information("HDR Fix Service is starting up...");
+            _logger.LogInformation("Service stop requested.");
+        }
+    }
 
+    #region Watchers
+
+    private void RequestRebuild(string reason)
+    {
+        if (Interlocked.Exchange(ref _rebuildRequested, 1) == 0)
+            _logger.LogInformation("Re-initializing watchers: {Reason}.", reason);
+    }
+
+    private async Task MonitorAsync(CancellationToken ct)
+    {
+        using var timer = new PeriodicTimer(MonitorInterval);
+        var lastFolderCheck = Stopwatch.StartNew();
+
+        while (await timer.WaitForNextTickAsync(ct))
+        {
             try
             {
-                lock (_watchersLock)
+                if (lastFolderCheck.Elapsed >= FolderCheckInterval)
                 {
-                    SetupWatchers(_optionsMonitor.CurrentValue);
+                    lastFolderCheck.Restart();
+
+                    if (AnyWatchedFolderMissing())
+                        RequestRebuild("a watched folder is missing");
                 }
 
-                _configChangeToken = _optionsMonitor.OnChange(newConfig =>
+                if (Interlocked.Exchange(ref _rebuildRequested, 0) == 1)
                 {
-                    Log.Information("Configuration changed. Re-initializing watchers...");
-
-                    lock (_watchersLock)
-                    {
-                        SetupWatchers(newConfig);
-                    }
-                });
-
-                await Task.Delay(Timeout.Infinite, stoppingToken);
-            }
-            catch (OperationCanceledException)
-            {
-                Log.Information("Service stop requested.");
+                    var settings = _options.CurrentValue;
+                    RebuildWatchers(settings);
+                    ScanRecentFiles(settings);
+                }
             }
             catch (Exception ex)
             {
-                Log.Fatal(ex, "Service encountered an unrecoverable error in the main loop.");
+                _logger.LogError(ex, "Watcher maintenance failed; will retry.");
+                Interlocked.Exchange(ref _rebuildRequested, 1);
             }
         }
+    }
 
-        private void SetupWatchers(Settings config)
+    private bool AnyWatchedFolderMissing()
+    {
+        lock (_watchersLock)
         {
-            ClearRootWatchers();
-            ClearInputWatchers();
-
-            if (config.WatchFolders == null || config.WatchFolders.Length == 0)
-            {
-                Log.Warning("No watch folders configured in appsettings.json.");
-                return;
-            }
-
-            foreach (var folder in config.WatchFolders)
-            {
-                if (!Directory.Exists(folder))
-                {
-                    Log.Warning("Target folder does not exist, folder name: {Folder}", folder);
-                    Directory.CreateDirectory(folder);
-                }
-
-                var rootWatcher = InitializeRootWatcher(folder);
-                _rootFoldersWatchers.Add(rootWatcher);
-
-                var watcher = InitializeInputWatcher(folder);
-                _watchers.Add(watcher);
-
-                Log.Information("Successfully attached watcher to: {Folder}", folder);
-            }
+            return _watchers.Any(w => !Directory.Exists(w.Path));
         }
+    }
 
-        private FileSystemWatcher InitializeRootWatcher(string folder)
-        {
-            string parentDir = Path.GetDirectoryName(folder);
-            string folderName = Path.GetFileName(folder);
-
-            var rootWatcher = new FileSystemWatcher(parentDir, folderName)
-            {
-                NotifyFilter = NotifyFilters.DirectoryName,
-                EnableRaisingEvents = true
-            };
-
-            rootWatcher.Deleted += OnFolderDeletion;
-
-            return rootWatcher;
-        }
-
-        private FileSystemWatcher InitializeInputWatcher(string folder)
-        {
-            var watcher = new FileSystemWatcher(folder)
-            {
-                Filter = StringConstants.JxrFilter,
-                NotifyFilter = NotifyFilters.FileName | NotifyFilters.LastWrite | NotifyFilters.Size,
-                IncludeSubdirectories = true,
-                EnableRaisingEvents = true
-            };
-
-            watcher.Created += OnFileEvent;
-            watcher.Changed += OnFileEvent;
-
-            return watcher;
-        }
-
-        private void ClearRootWatchers()
-        {
-            foreach (var rootWatcher in _rootFoldersWatchers)
-            {
-                rootWatcher.EnableRaisingEvents = false;
-                rootWatcher.Deleted -= OnFolderDeletion;
-                rootWatcher.Dispose();
-            }
-
-            _rootFoldersWatchers.Clear();
-        }
-
-        private void ClearInputWatchers()
+    private void RebuildWatchers(Settings settings)
+    {
+        lock (_watchersLock)
         {
             foreach (var watcher in _watchers)
             {
                 watcher.EnableRaisingEvents = false;
-
-                watcher.Created -= OnFileEvent;
-                watcher.Changed -= OnFileEvent;
-
                 watcher.Dispose();
             }
 
             _watchers.Clear();
-        }
 
-        private void OnFileEvent(object sender, FileSystemEventArgs eventArgs)
-        {
-            Task.Run(() => HandleNewFileAsync(eventArgs.FullPath, eventArgs.Name ?? string.Empty));
-        }
+            var folders = GetWatchFolders(settings);
 
-        private void OnFolderDeletion(object sender, FileSystemEventArgs eventArgs)
-        {
-            if (!Directory.Exists(eventArgs.FullPath))
-                Directory.CreateDirectory(eventArgs.FullPath);
-
-            Task.Run(() =>
+            if (folders.Count == 0)
             {
-                lock (_watchersLock)
-                {
-                    SetupWatchers(_optionsMonitor.CurrentValue);
-                }
-            });
-        }
-
-        private async Task HandleNewFileAsync(string fullPath, string relativeName)
-        {
-            if (!_processingFiles.TryAdd(fullPath, 0))
+                _logger.LogWarning("No watch folders configured in appsettings.json.");
                 return;
+            }
+
+            foreach (var folder in folders)
+            {
+                try
+                {
+                    if (!Directory.Exists(folder))
+                    {
+                        _logger.LogWarning("Watch folder does not exist, creating it: {Folder}", folder);
+                        Directory.CreateDirectory(folder);
+                    }
+
+                    _watchers.Add(CreateWatcher(folder));
+                    _logger.LogInformation("Watching: {Folder}", folder);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Could not watch folder {Folder}.", folder);
+                }
+            }
+        }
+    }
+
+    private FileSystemWatcher CreateWatcher(string folder)
+    {
+        var watcher = new FileSystemWatcher(folder, StringConstants.JxrFilter)
+        {
+            IncludeSubdirectories = true,
+            NotifyFilter = NotifyFilters.FileName | NotifyFilters.LastWrite | NotifyFilters.Size,
+            InternalBufferSize = 64 * 1024
+        };
+
+        watcher.Created += (_, e) => Enqueue(e.FullPath, folder);
+        watcher.Changed += (_, e) => Enqueue(e.FullPath, folder);
+        watcher.Renamed += (_, e) => Enqueue(e.FullPath, folder);
+        watcher.Error += (_, e) =>
+        {
+            _logger.LogWarning(e.GetException(), "File watcher error on {Folder}.", folder);
+            RequestRebuild("watcher error");
+        };
+
+        watcher.EnableRaisingEvents = true;
+        return watcher;
+    }
+
+    private static List<string> GetWatchFolders(Settings settings)
+    {
+        return (settings.WatchFolders ?? [])
+            .Where(f => !string.IsNullOrWhiteSpace(f))
+            .Select(OutputPaths.NormalizeFolder)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    private void ScanRecentFiles(Settings settings)
+    {
+        if (settings.ScanMaxAgeHours <= 0)
+            return;
+
+        var since = DateTime.Now.AddHours(-settings.ScanMaxAgeHours);
+        var options = new EnumerationOptions { RecurseSubdirectories = true, IgnoreInaccessible = true };
+        int found = 0;
+
+        foreach (var folder in GetWatchFolders(settings))
+        {
+            if (!Directory.Exists(folder))
+                continue;
 
             try
             {
-                var settings = _optionsMonitor.CurrentValue;
-
-                string relativeDir = Path.GetDirectoryName(relativeName) ?? string.Empty;
-                string outputFileName = Path.GetFileNameWithoutExtension(relativeName) + StringConstants.SdrJpg;
-
-                string targetDir;
-
-                if (string.IsNullOrWhiteSpace(settings.OutputPath))
-                    targetDir = Path.GetDirectoryName(fullPath);
-                else
-                    targetDir = Path.Combine(settings.OutputPath, relativeDir);
-
-                string outputPath = Path.Combine(targetDir, outputFileName);
-
-                if (File.Exists(outputPath))
-                    return;
-
-                await _concurrencySemaphore.WaitAsync();
-
-                try
+                foreach (var file in Directory.EnumerateFiles(folder, StringConstants.JxrFilter, options))
                 {
-                    await ProcessFileWithRetriesAsync(fullPath, outputPath, settings);
-                }
-                finally
-                {
-                    _concurrencySemaphore.Release();
+                    if (File.GetLastWriteTime(file) >= since && Enqueue(file, folder))
+                        found++;
                 }
             }
             catch (Exception ex)
             {
-                Log.Error(ex, "Unexpected error handling file: {File}", fullPath);
+                _logger.LogError(ex, "Scanning {Folder} failed.", folder);
+            }
+        }
+
+        if (found > 0)
+            _logger.LogInformation("Found {Count} unconverted screenshot(s) from the last {Hours} h.", found, settings.ScanMaxAgeHours);
+    }
+
+    #endregion Watchers
+
+    #region Queue
+
+    /// <returns>True when the file was queued.</returns>
+    private bool Enqueue(string inputPath, string watchRoot)
+    {
+        if (!inputPath.EndsWith(StringConstants.Jxr, StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        var settings = _options.CurrentValue;
+        string outputPath = OutputPaths.GetOutputPath(inputPath, watchRoot, settings.OutputPath, settings.HdrFixSettings.OutputFormat);
+
+        if (File.Exists(outputPath))
+            return false;
+
+        if (!_pending.TryAdd(inputPath, 0))
+            return false;
+
+        return _queue.Writer.TryWrite(new WorkItem(inputPath, watchRoot));
+    }
+
+    private async Task ConsumeQueueAsync(CancellationToken ct)
+    {
+        await foreach (var item in _queue.Reader.ReadAllAsync(ct))
+        {
+            try
+            {
+                await ConvertWithRetriesAsync(item, ct);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Unexpected error handling {File}.", item.InputPath);
             }
             finally
             {
-                _processingFiles.TryRemove(fullPath, out _);
+                _pending.TryRemove(item.InputPath, out _);
             }
-        }
 
-        private static async Task ProcessFileWithRetriesAsync(string inputPath, string outputPath, Settings options)
+            if (_queue.Reader.Count == 0)
+                ReleaseMemory();
+        }
+    }
+
+    private async Task ConvertWithRetriesAsync(WorkItem item, CancellationToken ct)
+    {
+        var settings = _options.CurrentValue;
+        int attempts = Math.Max(1, settings.Retries);
+        int delayMs = Math.Max(100, settings.DelayMs);
+        string fileName = Path.GetFileName(item.InputPath);
+
+        for (int attempt = 1; attempt <= attempts; attempt++)
         {
-            int maxRetries = Math.Max(1, options.Retries);
-            int delayMs = Math.Max(100, options.DelayMs);
+            if (!File.Exists(item.InputPath))
+                return;
 
-            for (int i = 0; i < maxRetries; i++)
+            string outputPath = OutputPaths.GetOutputPath(item.InputPath, item.WatchRoot, settings.OutputPath, settings.HdrFixSettings.OutputFormat);
+
+            if (File.Exists(outputPath))
+                return;
+
+            try
             {
-                try
-                {
-                    if (!File.Exists(inputPath))
-                        return;
+                await WaitUntilStableAsync(item.InputPath, delayMs, ct);
 
-                    string dir = Path.GetDirectoryName(outputPath);
+                var stopwatch = Stopwatch.StartNew();
+                var result = await Task.Run(
+                    () => HdrPipeline.ConvertFile(item.InputPath, outputPath, settings.HdrFixSettings, settings.MaxThreadsPerConversion),
+                    ct);
 
-                    if (dir != null && !Directory.Exists(dir))
-                        Directory.CreateDirectory(dir);
+                _logger.LogInformation(
+                    "Converted {File} ({Width}x{Height}, white {White:F0} nits, peak {Peak:F0} nits) in {Ms} ms -> {Output}",
+                    fileName, result.Width, result.Height, result.WhitePointNits, result.PeakNits, stopwatch.ElapsedMilliseconds, outputPath);
 
-                    Log.Information("Converting: {FileName}", Path.GetFileName(inputPath));
-
-                    await using (var stream = new FileStream(inputPath, FileMode.Open, FileAccess.Read, FileShare.Read))
-                    {
-                        HdrPipeline.Process(stream, outputPath, options.HdrFixSettings);
-                    }
-
-                    Log.Information("Conversion successful: {FileName}", Path.GetFileName(outputPath));
-
-                    return;
-                }
-                catch (IOException) when (i < maxRetries - 1)
-                {
-                    Log.Warning("File locked or being written. Retry {Current}/{Total} for {File}", i + 1, maxRetries, Path.GetFileName(inputPath));
-
-                    await Task.Delay(delayMs);
-                }
-                catch (Exception ex)
-                {
-                    Log.Error(ex, "Fatal error processing {File}", inputPath);
-                    return;
-                }
+                return;
             }
-
-            Log.Error("Failed to process {File} after {Count} attempts.", inputPath, maxRetries);
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex) when (attempt < attempts)
+            {
+                // Locked, still being written (truncated data fails to decode), etc. All worth a retry.
+                _logger.LogWarning("Attempt {Attempt}/{Total} failed for {File}: {Error}", attempt, attempts, fileName, ex.Message);
+                await Task.Delay(delayMs, ct);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Giving up on {File} after {Total} attempts.", fileName, attempts);
+            }
         }
+    }
 
-        public override void Dispose()
+    /// <summary>Waits until the file size stops changing (the capture tool has finished writing).</summary>
+    private static async Task WaitUntilStableAsync(string path, int delayMs, CancellationToken ct)
+    {
+        long lastSize = -1;
+
+        for (int i = 0; i < 20; i++)
         {
-            _configChangeToken?.Dispose();
+            long size = new FileInfo(path).Length;
 
-            lock (_watchersLock)
-            {
-                foreach (var rootWatcher in _rootFoldersWatchers)
-                    rootWatcher.Dispose();
+            if (size > 0 && size == lastSize)
+                return;
 
-                foreach (var watcher in _watchers)
-                    watcher.Dispose();
-            }
-
-            _concurrencySemaphore.Dispose();
-
-            base.Dispose();
-
-            GC.SuppressFinalize(this);
+            lastSize = size;
+            await Task.Delay(Math.Min(delayMs, 250), ct);
         }
+    }
+
+    private static void ReleaseMemory()
+    {
+        // Conversions allocate large buffers on the LOH; give the memory back while the service is idle.
+        GCSettings.LargeObjectHeapCompactionMode = GCLargeObjectHeapCompactionMode.CompactOnce;
+        GC.Collect();
+    }
+
+    #endregion Queue
+
+    public override void Dispose()
+    {
+        _configChangeToken?.Dispose();
+
+        lock (_watchersLock)
+        {
+            foreach (var watcher in _watchers)
+                watcher.Dispose();
+
+            _watchers.Clear();
+        }
+
+        base.Dispose();
     }
 }
